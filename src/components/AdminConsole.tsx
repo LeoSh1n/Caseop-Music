@@ -132,37 +132,52 @@ export function AdminConsole({
     return () => onPreviewConfigChange(null);
   }, [onPreviewConfigChange]);
 
-  const fetchMonitorAndUsers = useCallback(async () => {
-    if (!isFullAdmin) return;
-    setLoadingUsers(true);
-    try {
-      const data = await apiFetch<{
-        liveSessions: LiveUserSession[];
-        searchLogs: SearchLogEntry[];
-        listeningLogs: ListeningLogEntry[];
-        users: AppUser[];
-        authLogs: AuthEventLog[];
-        unsyncedCount: number;
-      }>('/api/admin/monitor');
-      setLiveSessions(data.liveSessions || []);
-      setSearchLogs(data.searchLogs || []);
-      setListeningLogs(data.listeningLogs || []);
-      setUsers(data.users || []);
-      setAuthLogs(data.authLogs || []);
-      setUnsyncedCount(data.unsyncedCount || 0);
-    } catch (err) {
-      setStatusMessage({
-        type: 'error',
-        text: err instanceof Error ? err.message : '데이터를 불러오지 못했습니다.',
-      });
-    } finally {
-      setLoadingUsers(false);
-    }
-  }, [isFullAdmin]);
+  const fetchMonitorAndUsers = useCallback(
+    async (silent: unknown = false) => {
+      if (!isFullAdmin) return;
+      const isSilent = silent === true;
+      if (!isSilent) setLoadingUsers(true);
+      try {
+        const data = await apiFetch<{
+          liveSessions: LiveUserSession[];
+          searchLogs: SearchLogEntry[];
+          listeningLogs: ListeningLogEntry[];
+          users: AppUser[];
+          authLogs: AuthEventLog[];
+          unsyncedCount: number;
+        }>('/api/admin/monitor');
+        setLiveSessions(data.liveSessions || []);
+        setSearchLogs(data.searchLogs || []);
+        setListeningLogs(data.listeningLogs || []);
+        setUsers(data.users || []);
+        setAuthLogs(data.authLogs || []);
+        setUnsyncedCount(data.unsyncedCount || 0);
+      } catch (err) {
+        if (!isSilent) {
+          setStatusMessage({
+            type: 'error',
+            text: err instanceof Error ? err.message : '데이터를 불러오지 못했습니다.',
+          });
+        }
+      } finally {
+        if (!isSilent) setLoadingUsers(false);
+      }
+    },
+    [isFullAdmin],
+  );
 
   useEffect(() => {
     fetchMonitorAndUsers();
   }, [fetchMonitorAndUsers]);
+
+  // Serverless-friendly polling fallback when SSE drops or runs behind edge functions
+  useEffect(() => {
+    if (!isFullAdmin || subTab !== 'monitor') return;
+    const timer = window.setInterval(() => {
+      void fetchMonitorAndUsers(true);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [isFullAdmin, subTab, fetchMonitorAndUsers]);
 
   // Real-time admin-only SSE subscription for live user screens & search/listening logs
   useEffect(() => {
