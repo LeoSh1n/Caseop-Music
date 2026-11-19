@@ -1,0 +1,6 @@
+{
+  "name": "Sonata Music",
+  "description": "Apple Music-inspired YouTube music streaming studio with Google Sheets user sync and live admin UI publishing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
