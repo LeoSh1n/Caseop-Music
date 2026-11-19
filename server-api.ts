@@ -150,27 +150,27 @@ const SEED_TRACKS: Track[] = [
   },
   {
     id: 'trk_4',
-    youtubeId: 'dxIG9Jtakws',
+    youtubeId: 'D1PvIWdJ8xo',
     title: 'Blueming',
     artist: 'IU (아이유)',
     album: 'Love poem',
     genre: 'K-Pop',
-    duration: '3:37',
-    durationSec: 217,
-    coverUrl: 'https://i.ytimg.com/vi/dxIG9Jtakws/hqdefault.jpg',
+    duration: '3:42',
+    durationSec: 222,
+    coverUrl: 'https://i.ytimg.com/vi/D1PvIWdJ8xo/hqdefault.jpg',
     createdAt: '2026-11-10T09:15:00.000Z',
     plays: 21340,
   },
   {
     id: 'trk_5',
-    youtubeId: 'D1PvIWdJ8xo',
+    youtubeId: 'TgOu00Mf3kI',
     title: 'eight (Prod. & Feat. SUGA)',
     artist: 'IU (아이유)',
     album: 'eight - Single',
     genre: 'K-Pop',
-    duration: '2:48',
-    durationSec: 168,
-    coverUrl: 'https://i.ytimg.com/vi/D1PvIWdJ8xo/hqdefault.jpg',
+    duration: '3:42',
+    durationSec: 222,
+    coverUrl: 'https://i.ytimg.com/vi/TgOu00Mf3kI/hqdefault.jpg',
     createdAt: '2026-11-10T09:20:00.000Z',
     plays: 19510,
   },
@@ -440,9 +440,30 @@ function loadStore(): StoreData {
     }
     const raw = fs.readFileSync(STORE_PATH, 'utf-8');
     const parsed = JSON.parse(raw) as StoreData;
+    const healedTracks = Array.isArray(parsed.tracks)
+      ? parsed.tracks.map((t) => {
+          if (t.id === 'trk_4' && t.youtubeId === 'dxIG9Jtakws') {
+            return {
+              ...t,
+              youtubeId: 'D1PvIWdJ8xo',
+              coverUrl: 'https://i.ytimg.com/vi/D1PvIWdJ8xo/hqdefault.jpg',
+            };
+          }
+          if (t.id === 'trk_5' && t.youtubeId === 'D1PvIWdJ8xo') {
+            return {
+              ...t,
+              youtubeId: 'TgOu00Mf3kI',
+              coverUrl: 'https://i.ytimg.com/vi/TgOu00Mf3kI/hqdefault.jpg',
+            };
+          }
+          return t;
+        })
+      : SEED_TRACKS;
+
     return {
       ...createInitialStore(),
       ...parsed,
+      tracks: healedTracks,
       searchLogs: Array.isArray(parsed.searchLogs) ? parsed.searchLogs : [],
       listeningLogs: Array.isArray(parsed.listeningLogs) ? parsed.listeningLogs : [],
       config: { ...DEFAULT_CONFIG, ...(parsed.config || {}) },
@@ -678,6 +699,91 @@ function parseIso8601Duration(iso: string): { label: string; seconds: number } {
   return { label, seconds: total };
 }
 
+interface YouTubeSearchPayload {
+  contents?: {
+    twoColumnSearchResultsRenderer?: {
+      primaryContents?: {
+        sectionListRenderer?: {
+          contents?: Array<{
+            itemSectionRenderer?: {
+              contents?: Array<{
+                videoRenderer?: {
+                  videoId?: string;
+                  title?: { runs?: Array<{ text?: string }> };
+                  ownerText?: { runs?: Array<{ text?: string }> };
+                  lengthText?: { simpleText?: string };
+                };
+              }>;
+            };
+          }>;
+        };
+      };
+    };
+  };
+}
+
+function extractTracksFromYouTubeSections(data: YouTubeSearchPayload): Track[] {
+  const sections =
+    data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer
+      ?.contents || [];
+  const results: Track[] = [];
+  const seen = new Set<string>();
+
+  for (const sec of sections) {
+    for (const item of sec?.itemSectionRenderer?.contents || []) {
+      const v = item?.videoRenderer;
+      if (!v?.videoId || seen.has(v.videoId)) continue;
+      seen.add(v.videoId);
+      const title =
+        v.title?.runs?.map((r) => r.text || '').join('').trim() || 'YouTube Track';
+      const artist =
+        v.ownerText?.runs?.map((r) => r.text || '').join('').trim() || 'YouTube Music';
+      const duration = v.lengthText?.simpleText?.trim() || 'LIVE';
+
+      results.push({
+        id: `yt_${v.videoId}`,
+        youtubeId: v.videoId,
+        title,
+        artist,
+        album: 'YouTube Search',
+        genre: 'YouTube',
+        duration,
+        durationSec: parseDurationToSeconds(duration),
+        coverUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+        createdAt: new Date().toISOString(),
+        plays: 0,
+      });
+
+      if (results.length >= 16) break;
+    }
+    if (results.length >= 16) break;
+  }
+  return results;
+}
+
+async function filterEmbeddableViaOEmbed(candidates: Track[]): Promise<Track[]> {
+  if (candidates.length === 0) return [];
+  const checks = await Promise.all(
+    candidates.slice(0, 14).map(async (track) => {
+      try {
+        const res = await fetch(
+          `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${track.youtubeId}&format=json`,
+          { signal: AbortSignal.timeout(2200) },
+        );
+        // 401/403/404 mean embedding is blocked or video unavailable
+        if (res.status === 401 || res.status === 403 || res.status === 404) {
+          return { track, ok: false };
+        }
+        return { track, ok: true };
+      } catch {
+        return { track, ok: true };
+      }
+    }),
+  );
+  const playable = checks.filter((c) => c.ok).map((c) => c.track);
+  return playable.length > 0 ? playable.slice(0, 12) : candidates.slice(0, 12);
+}
+
 async function searchYouTubeLive(query: string): Promise<Track[]> {
   const ytKey = process.env.YOUTUBE_API_KEY;
   if (ytKey) {
@@ -755,84 +861,64 @@ async function searchYouTubeLive(query: string): Promise<Track[]> {
         }
       }
     } catch {
-      // fall back to direct server-side YouTube search without exposing API key
+      // fall through to zero-key InnerTube / HTML fallback
     }
   }
 
-  // Zero-key live YouTube search via server-side fetch
-  const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=EgIQAQ%3D%3D`;
-  const ytHtmlRes = await fetch(searchUrl, {
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-      'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
-    },
-  });
-  if (!ytHtmlRes.ok) return [];
-  const html = await ytHtmlRes.text();
-  const match = html.match(/var ytInitialData = (\{.*?\});<\/script>/);
-  if (!match?.[1]) return [];
-
-  const data = JSON.parse(match[1]) as {
-    contents?: {
-      twoColumnSearchResultsRenderer?: {
-        primaryContents?: {
-          sectionListRenderer?: {
-            contents?: Array<{
-              itemSectionRenderer?: {
-                contents?: Array<{
-                  videoRenderer?: {
-                    videoId?: string;
-                    title?: { runs?: Array<{ text?: string }> };
-                    ownerText?: { runs?: Array<{ text?: string }> };
-                    lengthText?: { simpleText?: string };
-                  };
-                }>;
-              };
-            }>;
-          };
-        };
-      };
-    };
-  };
-
-  const sections =
-    data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer
-      ?.contents || [];
-  const results: Track[] = [];
-  const seen = new Set<string>();
-
-  for (const sec of sections) {
-    for (const item of sec?.itemSectionRenderer?.contents || []) {
-      const v = item?.videoRenderer;
-      if (!v?.videoId || seen.has(v.videoId)) continue;
-      seen.add(v.videoId);
-      const title =
-        v.title?.runs?.map((r) => r.text || '').join('').trim() || 'YouTube Track';
-      const artist =
-        v.ownerText?.runs?.map((r) => r.text || '').join('').trim() || 'YouTube Music';
-      const duration = v.lengthText?.simpleText?.trim() || 'LIVE';
-
-      results.push({
-        id: `yt_${v.videoId}`,
-        youtubeId: v.videoId,
-        title,
-        artist,
-        album: 'YouTube Search',
-        genre: 'YouTube',
-        duration,
-        durationSec: parseDurationToSeconds(duration),
-        coverUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-        createdAt: new Date().toISOString(),
-        plays: 0,
-      });
-
-      if (results.length >= 12) break;
+  // Layer 2: YouTube InnerTube JSON API (fast, reliable from serverless datacenter IPs)
+  try {
+    const itRes = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: 'WEB',
+            clientVersion: '2.20241101.00.00',
+            hl: 'ko',
+            gl: 'KR',
+          },
+        },
+        query,
+        params: 'EgIQAQ%3D%3D',
+      }),
+      signal: AbortSignal.timeout(4500),
+    });
+    if (itRes.ok) {
+      const itData = (await itRes.json()) as YouTubeSearchPayload;
+      const itTracks = extractTracksFromYouTubeSections(itData);
+      if (itTracks.length > 0) {
+        return await filterEmbeddableViaOEmbed(itTracks);
+      }
     }
-    if (results.length >= 12) break;
+  } catch {
+    // fall through to HTML scrape fallback
   }
 
-  return results;
+  // Layer 3: Direct HTML fallback
+  try {
+    const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=EgIQAQ%3D%3D`;
+    const ytHtmlRes = await fetch(searchUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
+      },
+      signal: AbortSignal.timeout(4500),
+    });
+    if (!ytHtmlRes.ok) return [];
+    const html = await ytHtmlRes.text();
+    const match = html.match(/var ytInitialData = (\{.*?\});<\/script>/);
+    if (!match?.[1]) return [];
+    const data = JSON.parse(match[1]) as YouTubeSearchPayload;
+    const htmlTracks = extractTracksFromYouTubeSections(data);
+    return await filterEmbeddableViaOEmbed(htmlTracks);
+  } catch {
+    return [];
+  }
 }
 
 const sseClients = new Set<Response>();

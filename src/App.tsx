@@ -13,6 +13,13 @@ import { PlayerDock, type RepeatMode } from './components/PlayerDock';
 import { Sidebar } from './components/Sidebar';
 import { YouTubeEngine } from './components/YouTubeEngine';
 import { apiFetch, setStoredSessionToken } from './lib/apiClient';
+import {
+  registerMediaSessionHandlers,
+  syncBackgroundAudioKeepAlive,
+  updateMediaSessionMetadata,
+  updateMediaSessionPlaybackState,
+  updateMediaSessionPosition,
+} from './lib/backgroundMedia';
 import { initFirebaseAuth, signOutFirebaseGoogle } from './lib/firebaseAuth';
 import { syncAllToSheets } from './services/sheetsService';
 import type {
@@ -112,6 +119,9 @@ export default function App() {
   const [showVideo, setShowVideo] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const currentTrackRef = useRef<Track | null>(null);
+  currentTrackRef.current = currentTrack;
+  const triedAltIdsRef = useRef<Set<string>>(new Set());
 
   // Sync HTML theme class & document title with activeConfig
   useEffect(() => {
@@ -353,24 +363,24 @@ export default function App() {
       if (newQueue && newQueue.length > 0) {
         setQueue(newQueue);
       }
-      setCurrentTrack((prev) => {
-        if (prev?.id === track.id) {
-          setIsPlaying((p) => {
-            const nextPlaying = !p;
-            reportListenActivity(track, nextPlaying ? 'RESUME' : 'PAUSE', currentTime);
-            return nextPlaying;
-          });
-          return prev;
-        }
-        setCurrentTime(0);
-        setDuration(track.durationSec || 0);
-        setIsPlaying(true);
-        fetch(`/api/tracks/${track.id}/play`, { method: 'POST' }).catch(() => {});
-        reportListenActivity(track, prev ? 'SWITCH' : 'PLAY', 0);
-        return track;
-      });
+      const prev = currentTrackRef.current;
+      if (prev?.id === track.id) {
+        const nextPlaying = !isPlaying;
+        syncBackgroundAudioKeepAlive(nextPlaying);
+        setIsPlaying(nextPlaying);
+        reportListenActivity(track, nextPlaying ? 'RESUME' : 'PAUSE', currentTime);
+        return;
+      }
+      triedAltIdsRef.current.clear();
+      syncBackgroundAudioKeepAlive(true);
+      setCurrentTrack(track);
+      setCurrentTime(0);
+      setDuration(track.durationSec || 0);
+      setIsPlaying(true);
+      fetch(`/api/tracks/${track.id}/play`, { method: 'POST' }).catch(() => {});
+      reportListenActivity(track, prev ? 'SWITCH' : 'PLAY', 0);
     },
-    [currentTime, reportListenActivity],
+    [isPlaying, currentTime, reportListenActivity],
   );
 
   const handlePlayPlaylist = useCallback(
@@ -436,6 +446,82 @@ export default function App() {
       reportListenActivity(prevTrack, 'PLAY', 0);
     }
   }, [queue, currentTrack, currentTime, reportListenActivity]);
+
+  // Keep background WebAudio loop & OS MediaSession synced for background/minimized playback
+  const mediaCallbacksRef = useRef({
+    handleNext,
+    handlePrev,
+    reportListenActivity,
+    currentTime,
+    duration,
+  });
+  mediaCallbacksRef.current = {
+    handleNext,
+    handlePrev,
+    reportListenActivity,
+    currentTime,
+    duration,
+  };
+
+  useEffect(() => {
+    syncBackgroundAudioKeepAlive(isPlaying);
+    updateMediaSessionPlaybackState(isPlaying, Boolean(currentTrack));
+  }, [isPlaying, currentTrack]);
+
+  useEffect(() => {
+    updateMediaSessionMetadata(currentTrack, activeConfig.appName);
+  }, [currentTrack, activeConfig.appName]);
+
+  useEffect(() => {
+    updateMediaSessionPosition(
+      currentTime,
+      duration || currentTrack?.durationSec || 0,
+      isPlaying,
+    );
+  }, [currentTime, duration, currentTrack?.durationSec, isPlaying]);
+
+  useEffect(() => {
+    return registerMediaSessionHandlers({
+      onPlay: () => {
+        const trk = currentTrackRef.current;
+        if (!trk) return;
+        syncBackgroundAudioKeepAlive(true);
+        setIsPlaying(true);
+        mediaCallbacksRef.current.reportListenActivity(
+          trk,
+          'RESUME',
+          mediaCallbacksRef.current.currentTime,
+        );
+      },
+      onPause: () => {
+        const trk = currentTrackRef.current;
+        syncBackgroundAudioKeepAlive(false);
+        setIsPlaying(false);
+        if (trk) {
+          mediaCallbacksRef.current.reportListenActivity(
+            trk,
+            'PAUSE',
+            mediaCallbacksRef.current.currentTime,
+          );
+        }
+      },
+      onPrev: () => mediaCallbacksRef.current.handlePrev(),
+      onNext: () => mediaCallbacksRef.current.handleNext(),
+      onSeekTo: (sec) => {
+        setCurrentTime(sec);
+        setSeekTarget({ seconds: sec, nonce: Date.now() });
+      },
+      onSeekBy: (delta) => {
+        const dur = mediaCallbacksRef.current.duration || currentTrackRef.current?.durationSec || 0;
+        const nextSec = Math.max(
+          0,
+          dur > 0 ? Math.min(dur, mediaCallbacksRef.current.currentTime + delta) : mediaCallbacksRef.current.currentTime + delta,
+        );
+        setCurrentTime(nextSec);
+        setSeekTarget({ seconds: nextSec, nonce: Date.now() });
+      },
+    });
+  }, []);
 
   // Real-time User Screen & Playback Presence Heartbeat
   const presencePayloadRef = useRef({
@@ -1026,27 +1112,37 @@ export default function App() {
           handleNext();
         }}
         onError={async (code) => {
-          if ((code === 101 || code === 150 || code === 100) && currentTrack) {
+          const failed = currentTrackRef.current;
+          if (!failed) return;
+          triedAltIdsRef.current.add(failed.youtubeId);
+
+          if ([2, 5, 100, 101, 150, 153].includes(code)) {
             setPlaybackError('재생 가능한 다른 공식 오디오/가사 버전을 찾는 중...');
             try {
-              const altQuery = `${currentTrack.title} ${currentTrack.artist} audio`;
+              const altQuery = `${failed.title} ${failed.artist} audio lyrics`;
               const res = await apiFetch<{ youtubeResults?: Track[] }>(
                 `/api/youtube/search?q=${encodeURIComponent(altQuery)}`,
               );
               const alt = (res.youtubeResults || []).find(
-                (t) => t.youtubeId !== currentTrack.youtubeId,
+                (t) => !triedAltIdsRef.current.has(t.youtubeId),
               );
               if (alt) {
+                triedAltIdsRef.current.add(alt.youtubeId);
                 setPlaybackError(null);
                 setCurrentTrack(alt);
+                setCurrentTime(0);
+                setDuration(alt.durationSec || 0);
                 setIsPlaying(true);
                 return;
               }
             } catch {
               // ignore fallback lookup errors
             }
-            setPlaybackError('이 영상은 외부 재생이 제한되어 다음 곡으로 이동합니다.');
-            window.setTimeout(() => handleNext(), 1200);
+            setPlaybackError('이 영상은 재생이 제한되어 다음 곡으로 이동합니다.');
+            window.setTimeout(() => {
+              triedAltIdsRef.current.clear();
+              handleNext();
+            }, 1000);
           } else {
             setPlaybackError('재생 중 일시적인 오류가 발생했습니다.');
           }
@@ -1070,15 +1166,14 @@ export default function App() {
         playbackError={playbackError}
         onTogglePlay={() => {
           if (!currentTrack) return;
-          setIsPlaying((p) => {
-            const nextPlaying = !p;
-            reportListenActivity(
-              currentTrack,
-              nextPlaying ? 'RESUME' : 'PAUSE',
-              currentTime,
-            );
-            return nextPlaying;
-          });
+          const nextPlaying = !isPlaying;
+          syncBackgroundAudioKeepAlive(nextPlaying);
+          setIsPlaying(nextPlaying);
+          reportListenActivity(
+            currentTrack,
+            nextPlaying ? 'RESUME' : 'PAUSE',
+            currentTime,
+          );
         }}
         onPrev={handlePrev}
         onNext={handleNext}
